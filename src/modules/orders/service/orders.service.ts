@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, NotFoundException, InternalServerErrorException } from '@nestjs/common';
 import { CreateOrderDto } from '../dto/create-order.dto';
 import { UpdateOrderDto } from '../dto/update-order.dto';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -8,17 +8,17 @@ import { OrderDetail } from '../../orders-details/entities/orders-detail.entity'
 
 @Injectable()
 export class OrdersService {
- constructor(
-  private datasource: DataSource,
-  @InjectRepository(Order)
-  private readonly orderRepository :  Repository<Order>,
-  @InjectRepository(OrderDetail)
-  private readonly orderDetailRepository : Repository<OrderDetail>
-){}
+  constructor(
+    private datasource: DataSource,
+    @InjectRepository(Order)
+    private readonly orderRepository: Repository<Order>,
+    @InjectRepository(OrderDetail)
+    private readonly orderDetailRepository: Repository<OrderDetail>,
+  ) {}
+
   async create(createOrderDto: CreateOrderDto) {
     return this.registerorder(createOrderDto);
   }
-
 
   async registerorder(createOrderDto: CreateOrderDto) {
     const queryRunner = this.datasource.createQueryRunner();
@@ -29,7 +29,7 @@ export class OrdersService {
       const { orderDetails } = createOrderDto;
 
       // Calcular el total de la orden
-      const total = orderDetails.reduce((acc, item) => acc + (item.quantity * item.unitprice), 0);
+      const total = orderDetails.reduce((acc, item) => acc + item.quantity * item.unitprice, 0);
 
       // Crear y guardar la orden
       const order = await queryRunner.manager.save(Order, {
@@ -61,15 +61,14 @@ export class OrdersService {
     } catch (error: any) {
       // Revertir la transacción en caso de error
       await queryRunner.rollbackTransaction();
-      throw error;
+      throw new InternalServerErrorException('Error creating order');
     } finally {
       // Liberar el queryRunner
       await queryRunner.release();
     }
   }
 
-
-   async  update(id: number, updateOrderDto: UpdateOrderDto) {
+  async update(id: number, updateOrderDto: UpdateOrderDto) {
     const queryRunner = this.datasource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
@@ -77,30 +76,63 @@ export class OrdersService {
     try {
       const order = await queryRunner.manager.findOne(Order, { where: { id } });
       if (!order) {
-        throw new Error(`Order with id ${id} not found`);
+        throw new NotFoundException(`Order with id ${id} not found`);
       }
-      const  updateorder = await  queryRunner.manager.save(Order, { ...order, ...updateOrderDto });
+
+      Object.assign(order, updateOrderDto);
+      const updatedOrder = await queryRunner.manager.save(Order, order);
+
+      await queryRunner.commitTransaction();
+      return updatedOrder;
     } catch (error) {
-      
+      await queryRunner.rollbackTransaction();
+      if (error instanceof NotFoundException) throw error;
+      throw new InternalServerErrorException('Error updating order');
+    } finally {
+      await queryRunner.release();
     }
-
-
-    return 
   }
 
-  findAll() {
-    return `This action returns all orders`;
+  async findAll() {
+    try {
+      return await this.orderRepository.find({
+        relations: ['customer', 'orderDetails'],
+      });
+    } catch (error) {
+      throw new InternalServerErrorException('Error fetching orders');
+    }
   }
 
-  findOne(id: number) {
-    const order = this.orderRepository.findOne({
-      where: { id },
-    });
-    return{order, message: 'Order found successfully'};
+  async findOne(id: number) {
+    try {
+      const order = await this.orderRepository.findOne({
+        where: { id },
+        relations: ['customer', 'orderDetails', 'country'],
+      });
+
+      if (!order) {
+        throw new NotFoundException(`Order with id ${id} not found`);
+      }
+
+      return order;
+    } catch (error) {
+      if (error instanceof NotFoundException) throw error;
+      throw new InternalServerErrorException('Error fetching order');
+    }
   }
 
- 
-  remove(id: number) {
-    return `This action removes a #${id} order`;
+  async remove(id: number) {
+    try {
+      const order = await this.findOne(id);
+
+      // Primero eliminar los detalles de la orden
+      await this.orderDetailRepository.delete({ order: { id } });
+
+      // Luego eliminar la orden
+      return await this.orderRepository.remove(order);
+    } catch (error) {
+      if (error instanceof NotFoundException) throw error;
+      throw new InternalServerErrorException('Error deleting order');
+    }
   }
 }
